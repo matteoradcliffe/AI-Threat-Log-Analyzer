@@ -1,6 +1,6 @@
-# AI Threat Analyzer
+# AI Threat Log Analyzer
 
-An AI-powered cybersecurity tool that analyzes Linux log files, detects suspicious activity, and generates plain-English threat summaries to assist with security investigations.
+An AI-assisted security investigation tool that analyzes Linux log files, detects suspicious activity, stores security events in SQL, and generates plain-English threat summaries.
 
 ## Overview
 
