@@ -1,1 +1,5 @@
-
+Jul 2 10:15:23 server sshd[1234]: Failed password for invalid user admin from 192.168.1.50 port 54321 ssh2
+Jul 2 10:15:30 server sshd[1235]: Failed password for root from 192.168.1.50 port 54322 ssh2
+Jul 2 10:15:37 server sshd[1236]: Failed password for test from 192.168.1.50 port 54323 ssh2
+Jul 2 10:16:02 server sshd[1237]: Accepted password for matteo from 192.168.1.20 port 54324 ssh2
+Jul 2 10:17:45 server sshd[1238]: Failed password for invalid user guest from 10.0.0.8 port 50001 ssh2
