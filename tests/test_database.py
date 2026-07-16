@@ -51,6 +51,17 @@ BRUTE_FORCE_ALERT: Alert = {
     "recommendation": "Review the source IP and block it if malicious.",
 }
 
+PASSWORD_SPRAYING_ALERT: Alert = {
+    "alert_type": "password_spraying",
+    "title": "Possible SSH password spraying",
+    "severity": "high",
+    "source_ip": "192.0.2.10",
+    "event_count": 3,
+    "distinct_username_count": 3,
+    "description": "Three usernames were targeted.",
+    "recommendation": "Review the targeted accounts.",
+}
+
 
 class DatabaseTests(unittest.TestCase):
     """Verify table creation, inserts, retrieval, and duplicate prevention."""
@@ -121,6 +132,13 @@ class DatabaseTests(unittest.TestCase):
 
         self.assertEqual(row, ("alerts",))
 
+        columns = {
+            row[1]
+            for row in self.connection.execute("PRAGMA table_info(alerts)").fetchall()
+        }
+        self.assertIn("distinct_username_count", columns)
+        self.assertIn("username", columns)
+
     def test_insert_and_retrieve_alerts(self) -> None:
         create_alerts_table(self.connection)
 
@@ -142,6 +160,56 @@ class DatabaseTests(unittest.TestCase):
         self.assertTrue(first_insert)
         self.assertFalse(duplicate_insert)
         self.assertEqual(len(get_all_alerts(self.connection)), 1)
+
+    def test_additional_alert_fields_are_stored(self) -> None:
+        create_alerts_table(self.connection)
+
+        insert_alert(self.connection, PASSWORD_SPRAYING_ALERT)
+        stored_alert = get_all_alerts(self.connection)[0]
+
+        self.assertEqual(stored_alert["distinct_username_count"], 3)
+        self.assertIsNone(stored_alert["username"])
+
+    def test_second_batch_does_not_add_duplicate_alerts(self) -> None:
+        create_alerts_table(self.connection)
+
+        first_count = insert_alerts(
+            self.connection, [BRUTE_FORCE_ALERT, PASSWORD_SPRAYING_ALERT]
+        )
+        second_count = insert_alerts(
+            self.connection, [BRUTE_FORCE_ALERT, PASSWORD_SPRAYING_ALERT]
+        )
+
+        self.assertEqual(first_count, 2)
+        self.assertEqual(second_count, 0)
+        self.assertEqual(len(get_all_alerts(self.connection)), 2)
+
+    def test_existing_alerts_table_is_upgraded(self) -> None:
+        self.connection.execute(
+            """
+            CREATE TABLE alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                alert_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                source_ip TEXT NOT NULL,
+                event_count INTEGER NOT NULL,
+                description TEXT NOT NULL,
+                recommendation TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (alert_type, source_ip, event_count)
+            )
+            """
+        )
+
+        create_alerts_table(self.connection)
+
+        columns = {
+            row[1]
+            for row in self.connection.execute("PRAGMA table_info(alerts)").fetchall()
+        }
+        self.assertIn("distinct_username_count", columns)
+        self.assertIn("username", columns)
 
 
 if __name__ == "__main__":

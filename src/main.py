@@ -13,7 +13,12 @@ from database import (
     insert_auth_events,
     open_database,
 )
-from detector import detect_ssh_brute_force
+from detector import (
+    detect_invalid_user_enumeration,
+    detect_password_spraying,
+    detect_ssh_brute_force,
+    detect_successful_login_after_failures,
+)
 from parser import AuthEvent, parse_auth_log_line
 
 
@@ -46,7 +51,11 @@ def print_stored_alert(alert: StoredAlert) -> None:
     print(f"Title:          {alert['title']}")
     print(f"Severity:       {alert['severity']}")
     print(f"Source IP:      {alert['source_ip']}")
-    print(f"Failed attempts: {alert['event_count']}")
+    print(f"Related events: {alert['event_count']}")
+    if alert.get("distinct_username_count") is not None:
+        print(f"Distinct users: {alert['distinct_username_count']}")
+    if alert.get("username"):
+        print(f"Username:       {alert['username']}")
     print(f"Description:    {alert['description']}")
     print(f"Recommendation: {alert['recommendation']}")
     print(f"Created at:     {alert['created_at']} UTC")
@@ -61,7 +70,17 @@ def main() -> None:
         create_auth_events_table(connection)
         create_alerts_table(connection)
         newly_stored_count = insert_auth_events(connection, parsed_events)
-        detected_alerts = detect_ssh_brute_force(connection)
+        alerts_by_type = {
+            "ssh_brute_force": detect_ssh_brute_force(connection),
+            "password_spraying": detect_password_spraying(connection),
+            "successful_login_after_failures": (
+                detect_successful_login_after_failures(connection)
+            ),
+            "invalid_user_enumeration": detect_invalid_user_enumeration(connection),
+        }
+        detected_alerts = [
+            alert for alerts in alerts_by_type.values() for alert in alerts
+        ]
         newly_stored_alert_count = insert_alerts(connection, detected_alerts)
         stored_alerts = get_all_alerts(connection)
 
@@ -69,6 +88,9 @@ def main() -> None:
     print(f"New events inserted: {newly_stored_count}")
     print(f"Alerts detected: {len(detected_alerts)}")
     print(f"New alerts inserted: {newly_stored_alert_count}")
+    print("Detected by type:")
+    for alert_type, alerts in alerts_by_type.items():
+        print(f"  {alert_type}: {len(alerts)}")
     print()
 
     if not stored_alerts:

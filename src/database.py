@@ -2,7 +2,7 @@
 
 import sqlite3
 from pathlib import Path
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 from parser import AuthEvent
 
@@ -31,6 +31,8 @@ class Alert(TypedDict):
     severity: str
     source_ip: str
     event_count: int
+    distinct_username_count: NotRequired[int | None]
+    username: NotRequired[str | None]
     description: str
     recommendation: str
 
@@ -77,6 +79,8 @@ def create_alerts_table(connection: sqlite3.Connection) -> None:
             severity TEXT NOT NULL,
             source_ip TEXT NOT NULL,
             event_count INTEGER NOT NULL,
+            distinct_username_count INTEGER,
+            username TEXT,
             description TEXT NOT NULL,
             recommendation TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -84,6 +88,17 @@ def create_alerts_table(connection: sqlite3.Connection) -> None:
         )
         """
     )
+
+    # Upgrade databases created before Milestone 4 without deleting their data.
+    existing_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(alerts)").fetchall()
+    }
+    if "distinct_username_count" not in existing_columns:
+        connection.execute(
+            "ALTER TABLE alerts ADD COLUMN distinct_username_count INTEGER"
+        )
+    if "username" not in existing_columns:
+        connection.execute("ALTER TABLE alerts ADD COLUMN username TEXT")
     connection.commit()
 
 
@@ -164,8 +179,8 @@ def insert_alert(connection: sqlite3.Connection, alert: Alert) -> bool:
         """
         INSERT OR IGNORE INTO alerts
             (alert_type, title, severity, source_ip, event_count,
-             description, recommendation)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+             distinct_username_count, username, description, recommendation)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             alert["alert_type"],
@@ -173,6 +188,8 @@ def insert_alert(connection: sqlite3.Connection, alert: Alert) -> bool:
             alert["severity"],
             alert["source_ip"],
             alert["event_count"],
+            alert.get("distinct_username_count"),
+            alert.get("username"),
             alert["description"],
             alert["recommendation"],
         ),
@@ -191,8 +208,9 @@ def insert_alerts(connection: sqlite3.Connection, alerts: list[Alert]) -> int:
                 """
                 INSERT OR IGNORE INTO alerts
                     (alert_type, title, severity, source_ip, event_count,
-                     description, recommendation)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                     distinct_username_count, username, description,
+                     recommendation)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     alert["alert_type"],
@@ -200,6 +218,8 @@ def insert_alerts(connection: sqlite3.Connection, alerts: list[Alert]) -> int:
                     alert["severity"],
                     alert["source_ip"],
                     alert["event_count"],
+                    alert.get("distinct_username_count"),
+                    alert.get("username"),
                     alert["description"],
                     alert["recommendation"],
                 ),
@@ -214,7 +234,8 @@ def get_all_alerts(connection: sqlite3.Connection) -> list[StoredAlert]:
     cursor = connection.execute(
         """
         SELECT id, alert_type, title, severity, source_ip, event_count,
-               description, recommendation, created_at
+               distinct_username_count, username, description, recommendation,
+               created_at
         FROM alerts
         ORDER BY id
         """
@@ -228,9 +249,11 @@ def get_all_alerts(connection: sqlite3.Connection) -> list[StoredAlert]:
             "severity": row[3],
             "source_ip": row[4],
             "event_count": row[5],
-            "description": row[6],
-            "recommendation": row[7],
-            "created_at": row[8],
+            "distinct_username_count": row[6],
+            "username": row[7],
+            "description": row[8],
+            "recommendation": row[9],
+            "created_at": row[10],
         }
         for row in cursor.fetchall()
     ]
