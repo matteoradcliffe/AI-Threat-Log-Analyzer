@@ -4,14 +4,18 @@ import ipaddress
 import re
 from typing import TypedDict
 
+from time_utils import DEFAULT_LOG_YEAR, normalize_syslog_timestamp
+
 
 class AuthEvent(TypedDict):
     """The structured fields extracted from one supported SSH log entry."""
 
     timestamp: str
+    event_timestamp: str
     username: str
     ip_address: str
     event_type: str
+    is_invalid_user: bool
     raw_message: str
 
 
@@ -26,7 +30,9 @@ SSH_AUTH_PATTERN = re.compile(
 )
 
 
-def parse_auth_log_line(line: str) -> AuthEvent | None:
+def parse_auth_log_line(
+    line: str, default_year: int = DEFAULT_LOG_YEAR
+) -> AuthEvent | None:
     """Convert one auth.log line into an event, or return None if unsupported.
 
     Only OpenSSH ``Failed password`` and ``Accepted password`` messages are
@@ -35,6 +41,11 @@ def parse_auth_log_line(line: str) -> AuthEvent | None:
     raw_message = line.rstrip("\r\n")
     match = SSH_AUTH_PATTERN.fullmatch(raw_message)
     if match is None:
+        return None
+
+    timestamp = match.group("timestamp")
+    event_timestamp = normalize_syslog_timestamp(timestamp, default_year)
+    if event_timestamp is None:
         return None
 
     ip_address = match.group("ip_address")
@@ -46,11 +57,14 @@ def parse_auth_log_line(line: str) -> AuthEvent | None:
 
     result = match.group("result")
     event_type = "failed_password" if result == "Failed" else "accepted_password"
+    is_invalid_user = "invalid user" in raw_message
 
     return {
-        "timestamp": match.group("timestamp"),
+        "timestamp": timestamp,
+        "event_timestamp": event_timestamp,
         "username": match.group("username"),
         "ip_address": ip_address,
         "event_type": event_type,
+        "is_invalid_user": is_invalid_user,
         "raw_message": raw_message,
     }

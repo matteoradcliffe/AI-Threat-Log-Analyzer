@@ -1,8 +1,9 @@
-"""Unit tests for SSH brute-force detection."""
+"""Tests for sliding-window SSH authentication detections."""
 
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
@@ -25,263 +26,235 @@ from parser import AuthEvent  # noqa: E402
 
 def make_event(
     number: int,
-    ip_address: str,
-    event_type: str,
-    username: str = "testuser",
-    invalid_user: bool = False,
+    minute: int,
+    ip_address: str = "203.0.113.42",
+    username: str = "alice",
+    event_type: str = "failed_password",
+    invalid: bool = False,
+    day: int = 11,
 ) -> AuthEvent:
-    """Build a distinct authentication event for a detector test."""
-    result = "Accepted" if event_type == "accepted_password" else "Failed"
-    invalid_text = "invalid user " if invalid_user else ""
+    """Build an event with independently controlled timestamp and insertion ID."""
+    event_time = datetime(2026, 7, day, 9, 0) + timedelta(minutes=minute)
     return {
-        "timestamp": f"Jul 11 09:15:{number:02d}",
+        "timestamp": event_time.strftime("%b %d %H:%M:%S"),
+        "event_timestamp": event_time.isoformat(timespec="seconds"),
         "username": username,
         "ip_address": ip_address,
         "event_type": event_type,
-        "raw_message": (
-            f"Jul 11 09:15:{number:02d} test sshd[{number}]: {result} password "
-            f"for {invalid_text}{username} from {ip_address} port 22 ssh2"
-        ),
+        "is_invalid_user": invalid,
+        "raw_message": f"structured event {number}",
     }
 
 
-class BruteForceDetectorTests(unittest.TestCase):
-    """Verify SQL-based failed-login counting behavior."""
+class DetectorTestCase(unittest.TestCase):
+    """Provide a fresh normalized event database for each detector test."""
 
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
-        database_path = Path(self.temporary_directory.name) / "detector.db"
-        self.connection = open_database(database_path)
+        self.connection = open_database(
+            Path(self.temporary_directory.name) / "detector.db"
+        )
         create_auth_events_table(self.connection)
 
     def tearDown(self) -> None:
         self.connection.close()
         self.temporary_directory.cleanup()
 
-    def test_three_failed_logins_create_alert(self) -> None:
-        events = [
-            make_event(number, "203.0.113.42", "failed_password")
-            for number in range(1, 4)
-        ]
+    def store(self, events: list[AuthEvent]) -> None:
+        """Insert test events into the current database."""
         insert_auth_events(self.connection, events)
 
-        alerts = detect_ssh_brute_force(self.connection)
 
+class BruteForceDetectorTests(DetectorTestCase):
+    def test_triggers_inside_window(self) -> None:
+        self.store([make_event(i, minute) for i, minute in enumerate([0, 2, 4])])
+        alerts = detect_ssh_brute_force(self.connection)
         self.assertEqual(len(alerts), 1)
-        self.assertEqual(alerts[0]["source_ip"], "203.0.113.42")
-        self.assertEqual(alerts[0]["event_count"], 3)
+        self.assertEqual(alerts[0]["window_start"], "2026-07-11T09:00:00")
+        self.assertEqual(alerts[0]["window_end"], "2026-07-11T09:04:00")
 
-    def test_fewer_than_three_failed_logins_do_not_create_alert(self) -> None:
-        events = [
-            make_event(number, "203.0.113.42", "failed_password")
-            for number in range(1, 3)
-        ]
-        insert_auth_events(self.connection, events)
-
+    def test_does_not_trigger_outside_window(self) -> None:
+        self.store([make_event(i, minute) for i, minute in enumerate([0, 60, 120])])
         self.assertEqual(detect_ssh_brute_force(self.connection), [])
 
-    def test_successful_logins_are_not_counted(self) -> None:
-        events = [
-            make_event(1, "203.0.113.42", "failed_password"),
-            make_event(2, "203.0.113.42", "failed_password"),
-            make_event(3, "203.0.113.42", "accepted_password"),
-        ]
-        insert_auth_events(self.connection, events)
-
-        self.assertEqual(detect_ssh_brute_force(self.connection), [])
-
-    def test_failed_attempts_from_ips_are_counted_separately(self) -> None:
-        events = [
-            make_event(number, "203.0.113.42", "failed_password")
-            for number in range(1, 4)
-        ]
-        events.extend(
-            make_event(number, "198.51.100.77", "failed_password")
-            for number in range(4, 7)
+    def test_finds_later_cluster(self) -> None:
+        self.store(
+            [make_event(i, minute) for i, minute in enumerate([0, 60, 120, 121, 122])]
         )
-        insert_auth_events(self.connection, events)
-
         alerts = detect_ssh_brute_force(self.connection)
-
-        self.assertEqual(len(alerts), 2)
-        self.assertEqual(
-            {alert["source_ip"] for alert in alerts},
-            {"203.0.113.42", "198.51.100.77"},
-        )
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["window_start"], "2026-07-11T11:00:00")
 
     def test_custom_threshold(self) -> None:
-        events = [
-            make_event(number, "203.0.113.42", "failed_password")
-            for number in range(1, 5)
-        ]
-        insert_auth_events(self.connection, events)
+        self.store([make_event(i, i) for i in range(4)])
+        self.assertEqual(
+            detect_ssh_brute_force(self.connection, threshold=5), []
+        )
+        self.assertEqual(
+            len(detect_ssh_brute_force(self.connection, threshold=4)), 1
+        )
 
-        below_threshold = detect_ssh_brute_force(self.connection, threshold=5)
-        at_threshold = detect_ssh_brute_force(self.connection, threshold=4)
+    def test_custom_window(self) -> None:
+        self.store([make_event(i, minute) for i, minute in enumerate([0, 5, 10])])
+        self.assertEqual(detect_ssh_brute_force(self.connection), [])
+        self.assertEqual(
+            len(detect_ssh_brute_force(self.connection, window_minutes=10)), 1
+        )
 
-        self.assertEqual(below_threshold, [])
-        self.assertEqual(len(at_threshold), 1)
-        self.assertEqual(at_threshold[0]["event_count"], 4)
+    def test_ips_are_evaluated_separately(self) -> None:
+        events = [make_event(i, i) for i in range(3)]
+        events += [make_event(i + 3, i, ip_address="198.51.100.2") for i in range(2)]
+        self.store(events)
+        alerts = detect_ssh_brute_force(self.connection)
+        self.assertEqual([alert["source_ip"] for alert in alerts], ["203.0.113.42"])
 
-    def test_password_spraying_targets_distinct_usernames(self) -> None:
-        events = [
-            make_event(number, "192.0.2.10", "failed_password", username)
-            for number, username in enumerate(["alice", "bob", "carol"], start=1)
-        ]
-        insert_auth_events(self.connection, events)
 
+class PasswordSprayingDetectorTests(DetectorTestCase):
+    def test_distinct_users_inside_window_trigger(self) -> None:
+        self.store(
+            [
+                make_event(1, 0, username="alice"),
+                make_event(2, 4, username="bob"),
+                make_event(3, 9, username="carol"),
+            ]
+        )
         alerts = detect_password_spraying(self.connection)
-
         self.assertEqual(len(alerts), 1)
-        self.assertEqual(alerts[0]["event_count"], 3)
         self.assertEqual(alerts[0]["distinct_username_count"], 3)
 
-    def test_password_spraying_ignores_repeated_single_username(self) -> None:
-        events = [
-            make_event(number, "192.0.2.10", "failed_password", "alice")
-            for number in range(1, 5)
-        ]
-        insert_auth_events(self.connection, events)
-
+    def test_users_spread_too_far_apart_do_not_combine(self) -> None:
+        self.store(
+            [
+                make_event(1, 0, username="alice"),
+                make_event(2, 20, username="bob"),
+                make_event(3, 40, username="carol"),
+            ]
+        )
         self.assertEqual(detect_password_spraying(self.connection), [])
 
-    def test_password_spraying_custom_threshold(self) -> None:
-        events = [
-            make_event(1, "192.0.2.10", "failed_password", "alice"),
-            make_event(2, "192.0.2.10", "failed_password", "bob"),
-        ]
-        insert_auth_events(self.connection, events)
-
+    def test_repeated_username_does_not_count_as_distinct(self) -> None:
+        self.store([make_event(i, i, username="alice") for i in range(5)])
         self.assertEqual(detect_password_spraying(self.connection), [])
-        self.assertEqual(
-            len(detect_password_spraying(self.connection, username_threshold=2)),
-            1,
+
+    def test_custom_threshold_and_window(self) -> None:
+        self.store(
+            [
+                make_event(1, 0, username="alice"),
+                make_event(2, 12, username="bob"),
+            ]
         )
-
-    def test_success_after_enough_failures_creates_alert(self) -> None:
-        events = [
-            make_event(number, "203.0.113.20", "failed_password")
-            for number in range(1, 4)
-        ]
-        events.append(
-            make_event(4, "203.0.113.20", "accepted_password", "alice")
-        )
-        insert_auth_events(self.connection, events)
-
-        alerts = detect_successful_login_after_failures(self.connection)
-
-        self.assertEqual(len(alerts), 1)
-        self.assertEqual(alerts[0]["event_count"], 3)
-        self.assertEqual(alerts[0]["username"], "alice")
-
-    def test_success_before_failures_does_not_create_alert(self) -> None:
-        events = [
-            make_event(1, "203.0.113.20", "accepted_password", "alice")
-        ]
-        events.extend(
-            make_event(number, "203.0.113.20", "failed_password")
-            for number in range(2, 5)
-        )
-        insert_auth_events(self.connection, events)
-
-        self.assertEqual(
-            detect_successful_login_after_failures(self.connection), []
-        )
-
-    def test_success_and_failures_from_different_ips_are_not_combined(self) -> None:
-        events = [
-            make_event(number, "203.0.113.20", "failed_password")
-            for number in range(1, 4)
-        ]
-        events.append(
-            make_event(4, "203.0.113.21", "accepted_password", "alice")
-        )
-        insert_auth_events(self.connection, events)
-
-        self.assertEqual(
-            detect_successful_login_after_failures(self.connection), []
-        )
-
-    def test_success_after_failures_custom_threshold(self) -> None:
-        events = [
-            make_event(1, "203.0.113.20", "failed_password"),
-            make_event(2, "203.0.113.20", "failed_password"),
-            make_event(3, "203.0.113.20", "accepted_password", "alice"),
-        ]
-        insert_auth_events(self.connection, events)
-
-        self.assertEqual(
-            detect_successful_login_after_failures(self.connection), []
-        )
+        self.assertEqual(detect_password_spraying(self.connection), [])
         self.assertEqual(
             len(
-                detect_successful_login_after_failures(
-                    self.connection, failure_threshold=2
+                detect_password_spraying(
+                    self.connection, username_threshold=2, window_minutes=15
                 )
             ),
             1,
         )
 
-    def test_invalid_user_enumeration_targets_distinct_invalid_users(self) -> None:
-        events = [
-            make_event(
-                number,
-                "198.51.100.30",
-                "failed_password",
-                username,
-                invalid_user=True,
-            )
-            for number, username in enumerate(["admin", "guest", "support"], start=1)
-        ]
-        insert_auth_events(self.connection, events)
 
-        alerts = detect_invalid_user_enumeration(self.connection)
-
+class SuccessfulLoginDetectorTests(DetectorTestCase):
+    def test_success_after_failures_inside_window_triggers(self) -> None:
+        events = [make_event(i, i) for i in range(3)]
+        events.append(make_event(4, 4, event_type="accepted_password"))
+        self.store(events)
+        alerts = detect_successful_login_after_failures(self.connection)
         self.assertEqual(len(alerts), 1)
-        self.assertEqual(alerts[0]["distinct_username_count"], 3)
+        self.assertEqual(
+            alerts[0]["successful_login_timestamp"], "2026-07-11T09:04:00"
+        )
 
-    def test_invalid_user_enumeration_ignores_valid_user_failures(self) -> None:
-        events = [
-            make_event(number, "198.51.100.30", "failed_password", username)
-            for number, username in enumerate(["alice", "bob", "carol"], start=1)
-        ]
-        insert_auth_events(self.connection, events)
+    def test_success_outside_window_does_not_trigger(self) -> None:
+        events = [make_event(i, i) for i in range(3)]
+        events.append(make_event(4, 20, event_type="accepted_password"))
+        self.store(events)
+        self.assertEqual(detect_successful_login_after_failures(self.connection), [])
 
-        self.assertEqual(detect_invalid_user_enumeration(self.connection), [])
+    def test_success_before_failures_does_not_trigger(self) -> None:
+        events = [make_event(1, 0, event_type="accepted_password")]
+        events += [make_event(i + 2, i + 1) for i in range(3)]
+        self.store(events)
+        self.assertEqual(detect_successful_login_after_failures(self.connection), [])
 
-    def test_invalid_user_enumeration_ignores_repeated_username(self) -> None:
-        events = [
+    def test_events_must_belong_to_same_ip(self) -> None:
+        events = [make_event(i, i) for i in range(3)]
+        events.append(
             make_event(
-                number,
-                "198.51.100.30",
-                "failed_password",
-                "admin",
-                invalid_user=True,
+                4, 4, ip_address="198.51.100.2", event_type="accepted_password"
             )
-            for number in range(1, 5)
-        ]
-        insert_auth_events(self.connection, events)
+        )
+        self.store(events)
+        self.assertEqual(detect_successful_login_after_failures(self.connection), [])
 
-        self.assertEqual(detect_invalid_user_enumeration(self.connection), [])
+    def test_timestamp_order_overrides_insertion_order(self) -> None:
+        success = make_event(1, 4, event_type="accepted_password")
+        failures = [make_event(i + 2, i) for i in range(3)]
+        self.store([success, *failures])
+        self.assertEqual(
+            len(detect_successful_login_after_failures(self.connection)), 1
+        )
 
-    def test_invalid_user_enumeration_custom_threshold(self) -> None:
+    def test_row_id_breaks_equal_timestamp_ties(self) -> None:
+        failures = [make_event(i, 0) for i in range(3)]
+        success = make_event(4, 0, event_type="accepted_password")
+        self.store([*failures, success])
+        self.assertEqual(
+            len(detect_successful_login_after_failures(self.connection)), 1
+        )
+
+
+class InvalidUserEnumerationTests(DetectorTestCase):
+    def test_invalid_users_inside_window_trigger(self) -> None:
+        self.store(
+            [
+                make_event(1, 0, username="guest", invalid=True),
+                make_event(2, 4, username="support", invalid=True),
+                make_event(3, 9, username="admin", invalid=True),
+            ]
+        )
+        self.assertEqual(
+            len(detect_invalid_user_enumeration(self.connection)), 1
+        )
+
+    def test_uses_structured_flag_not_raw_message(self) -> None:
         events = [
-            make_event(
-                number,
-                "198.51.100.30",
-                "failed_password",
-                username,
-                invalid_user=True,
-            )
-            for number, username in enumerate(["admin", "guest"], start=1)
+            make_event(i, i, username=f"fake{i}", invalid=True) for i in range(3)
         ]
-        insert_auth_events(self.connection, events)
+        self.assertTrue(all("invalid user" not in event["raw_message"] for event in events))
+        self.store(events)
+        self.assertEqual(
+            len(detect_invalid_user_enumeration(self.connection)), 1
+        )
 
+    def test_raw_text_without_structured_flag_does_not_trigger(self) -> None:
+        events = [make_event(i, i, username=f"fake{i}") for i in range(3)]
+        for event in events:
+            event["raw_message"] += " invalid user"
+        self.store(events)
         self.assertEqual(detect_invalid_user_enumeration(self.connection), [])
+
+    def test_invalid_users_spread_too_far_apart_do_not_trigger(self) -> None:
+        self.store(
+            [
+                make_event(1, 0, username="guest", invalid=True),
+                make_event(2, 20, username="support", invalid=True),
+                make_event(3, 40, username="admin", invalid=True),
+            ]
+        )
+        self.assertEqual(detect_invalid_user_enumeration(self.connection), [])
+
+    def test_custom_threshold_and_window(self) -> None:
+        self.store(
+            [
+                make_event(1, 0, username="guest", invalid=True),
+                make_event(2, 12, username="support", invalid=True),
+            ]
+        )
         self.assertEqual(
             len(
                 detect_invalid_user_enumeration(
-                    self.connection, username_threshold=2
+                    self.connection, username_threshold=2, window_minutes=15
                 )
             ),
             1,

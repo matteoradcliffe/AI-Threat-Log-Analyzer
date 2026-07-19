@@ -17,9 +17,11 @@ class StoredAuthEvent(TypedDict):
 
     id: int
     timestamp: str
+    event_timestamp: str | None
     username: str
     ip_address: str
     event_type: str
+    is_invalid_user: bool
     raw_message: str
 
 
@@ -33,6 +35,9 @@ class Alert(TypedDict):
     event_count: int
     distinct_username_count: NotRequired[int | None]
     username: NotRequired[str | None]
+    window_start: str
+    window_end: str
+    successful_login_timestamp: NotRequired[str | None]
     description: str
     recommendation: str
 
@@ -58,13 +63,35 @@ def create_auth_events_table(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS auth_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT NOT NULL,
+            event_timestamp TEXT,
             username TEXT NOT NULL,
             ip_address TEXT NOT NULL,
             event_type TEXT NOT NULL,
+            is_invalid_user INTEGER NOT NULL DEFAULT 0
+                CHECK (is_invalid_user IN (0, 1)),
             raw_message TEXT NOT NULL UNIQUE
         )
         """
     )
+
+    # Legacy rows retain their original evidence. Their unknown year is not guessed.
+    existing_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(auth_events)")
+    }
+    if "event_timestamp" not in existing_columns:
+        connection.execute("ALTER TABLE auth_events ADD COLUMN event_timestamp TEXT")
+    if "is_invalid_user" not in existing_columns:
+        connection.execute(
+            "ALTER TABLE auth_events "
+            "ADD COLUMN is_invalid_user INTEGER NOT NULL DEFAULT 0"
+        )
+        connection.execute(
+            """
+            UPDATE auth_events
+            SET is_invalid_user = 1
+            WHERE raw_message LIKE '%invalid user%'
+            """
+        )
     connection.commit()
 
 
@@ -81,24 +108,84 @@ def create_alerts_table(connection: sqlite3.Connection) -> None:
             event_count INTEGER NOT NULL,
             distinct_username_count INTEGER,
             username TEXT,
+            window_start TEXT,
+            window_end TEXT,
+            successful_login_timestamp TEXT,
             description TEXT NOT NULL,
             recommendation TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE (alert_type, source_ip, event_count)
+            UNIQUE (alert_type, source_ip, window_start, window_end)
         )
         """
     )
 
-    # Upgrade databases created before Milestone 4 without deleting their data.
     existing_columns = {
         row[1] for row in connection.execute("PRAGMA table_info(alerts)").fetchall()
     }
-    if "distinct_username_count" not in existing_columns:
+    additions = {
+        "distinct_username_count": "INTEGER",
+        "username": "TEXT",
+        "window_start": "TEXT",
+        "window_end": "TEXT",
+        "successful_login_timestamp": "TEXT",
+    }
+    for column_name, column_type in additions.items():
+        if column_name not in existing_columns:
+            connection.execute(
+                f"ALTER TABLE alerts ADD COLUMN {column_name} {column_type}"
+            )
+
+    table_sql = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'alerts'"
+    ).fetchone()[0]
+    if "UNIQUE (alert_type, source_ip, event_count)" in table_sql:
+        # SQLite cannot drop a table-level UNIQUE constraint, so rebuild in place.
         connection.execute(
-            "ALTER TABLE alerts ADD COLUMN distinct_username_count INTEGER"
+            """
+            CREATE TABLE alerts_milestone5 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                alert_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                source_ip TEXT NOT NULL,
+                event_count INTEGER NOT NULL,
+                distinct_username_count INTEGER,
+                username TEXT,
+                window_start TEXT,
+                window_end TEXT,
+                successful_login_timestamp TEXT,
+                description TEXT NOT NULL,
+                recommendation TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (alert_type, source_ip, window_start, window_end)
+            )
+            """
         )
-    if "username" not in existing_columns:
-        connection.execute("ALTER TABLE alerts ADD COLUMN username TEXT")
+        connection.execute(
+            """
+            INSERT INTO alerts_milestone5 (
+                id, alert_type, title, severity, source_ip, event_count,
+                distinct_username_count, username, window_start, window_end,
+                successful_login_timestamp, description, recommendation,
+                created_at
+            )
+            SELECT id, alert_type, title, severity, source_ip, event_count,
+                   distinct_username_count, username, window_start, window_end,
+                   successful_login_timestamp, description, recommendation,
+                   created_at
+            FROM alerts
+            """
+        )
+        connection.execute("DROP TABLE alerts")
+        connection.execute("ALTER TABLE alerts_milestone5 RENAME TO alerts")
+
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS alerts_window_identity
+        ON alerts (alert_type, source_ip, window_start, window_end)
+        WHERE window_start IS NOT NULL AND window_end IS NOT NULL
+        """
+    )
     connection.commit()
 
 
@@ -107,19 +194,37 @@ def insert_auth_event(connection: sqlite3.Connection, event: AuthEvent) -> bool:
     cursor = connection.execute(
         """
         INSERT OR IGNORE INTO auth_events
-            (timestamp, username, ip_address, event_type, raw_message)
-        VALUES (?, ?, ?, ?, ?)
+            (timestamp, event_timestamp, username, ip_address, event_type,
+             is_invalid_user, raw_message)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (
             event["timestamp"],
+            event["event_timestamp"],
             event["username"],
             event["ip_address"],
             event["event_type"],
+            int(event["is_invalid_user"]),
             event["raw_message"],
         ),
     )
+    inserted = cursor.rowcount == 1
+    if not inserted:
+        connection.execute(
+            """
+            UPDATE auth_events
+            SET event_timestamp = COALESCE(event_timestamp, ?),
+                is_invalid_user = ?
+            WHERE raw_message = ?
+            """,
+            (
+                event["event_timestamp"],
+                int(event["is_invalid_user"]),
+                event["raw_message"],
+            ),
+        )
     connection.commit()
-    return cursor.rowcount == 1
+    return inserted
 
 
 def insert_auth_events(
@@ -134,18 +239,35 @@ def insert_auth_events(
             cursor = connection.execute(
                 """
                 INSERT OR IGNORE INTO auth_events
-                    (timestamp, username, ip_address, event_type, raw_message)
-                VALUES (?, ?, ?, ?, ?)
+                    (timestamp, event_timestamp, username, ip_address, event_type,
+                     is_invalid_user, raw_message)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event["timestamp"],
+                    event["event_timestamp"],
                     event["username"],
                     event["ip_address"],
                     event["event_type"],
+                    int(event["is_invalid_user"]),
                     event["raw_message"],
                 ),
             )
             inserted_count += cursor.rowcount
+            if cursor.rowcount == 0:
+                connection.execute(
+                    """
+                    UPDATE auth_events
+                    SET event_timestamp = COALESCE(event_timestamp, ?),
+                        is_invalid_user = ?
+                    WHERE raw_message = ?
+                    """,
+                    (
+                        event["event_timestamp"],
+                        int(event["is_invalid_user"]),
+                        event["raw_message"],
+                    ),
+                )
 
     return inserted_count
 
@@ -154,7 +276,8 @@ def get_all_auth_events(connection: sqlite3.Connection) -> list[StoredAuthEvent]
     """Retrieve every stored event in insertion order."""
     cursor = connection.execute(
         """
-        SELECT id, timestamp, username, ip_address, event_type, raw_message
+        SELECT id, timestamp, event_timestamp, username, ip_address, event_type,
+               is_invalid_user, raw_message
         FROM auth_events
         ORDER BY id
         """
@@ -164,10 +287,12 @@ def get_all_auth_events(connection: sqlite3.Connection) -> list[StoredAuthEvent]
         {
             "id": row[0],
             "timestamp": row[1],
-            "username": row[2],
-            "ip_address": row[3],
-            "event_type": row[4],
-            "raw_message": row[5],
+            "event_timestamp": row[2],
+            "username": row[3],
+            "ip_address": row[4],
+            "event_type": row[5],
+            "is_invalid_user": bool(row[6]),
+            "raw_message": row[7],
         }
         for row in cursor.fetchall()
     ]
@@ -179,8 +304,9 @@ def insert_alert(connection: sqlite3.Connection, alert: Alert) -> bool:
         """
         INSERT OR IGNORE INTO alerts
             (alert_type, title, severity, source_ip, event_count,
-             distinct_username_count, username, description, recommendation)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             distinct_username_count, username, window_start, window_end,
+             successful_login_timestamp, description, recommendation)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             alert["alert_type"],
@@ -190,6 +316,9 @@ def insert_alert(connection: sqlite3.Connection, alert: Alert) -> bool:
             alert["event_count"],
             alert.get("distinct_username_count"),
             alert.get("username"),
+            alert["window_start"],
+            alert["window_end"],
+            alert.get("successful_login_timestamp"),
             alert["description"],
             alert["recommendation"],
         ),
@@ -208,9 +337,9 @@ def insert_alerts(connection: sqlite3.Connection, alerts: list[Alert]) -> int:
                 """
                 INSERT OR IGNORE INTO alerts
                     (alert_type, title, severity, source_ip, event_count,
-                     distinct_username_count, username, description,
-                     recommendation)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     distinct_username_count, username, window_start, window_end,
+                     successful_login_timestamp, description, recommendation)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     alert["alert_type"],
@@ -220,6 +349,9 @@ def insert_alerts(connection: sqlite3.Connection, alerts: list[Alert]) -> int:
                     alert["event_count"],
                     alert.get("distinct_username_count"),
                     alert.get("username"),
+                    alert["window_start"],
+                    alert["window_end"],
+                    alert.get("successful_login_timestamp"),
                     alert["description"],
                     alert["recommendation"],
                 ),
@@ -235,7 +367,7 @@ def get_all_alerts(connection: sqlite3.Connection) -> list[StoredAlert]:
         """
         SELECT id, alert_type, title, severity, source_ip, event_count,
                distinct_username_count, username, description, recommendation,
-               created_at
+               created_at, window_start, window_end, successful_login_timestamp
         FROM alerts
         ORDER BY id
         """
@@ -254,6 +386,9 @@ def get_all_alerts(connection: sqlite3.Connection) -> list[StoredAlert]:
             "description": row[8],
             "recommendation": row[9],
             "created_at": row[10],
+            "window_start": row[11],
+            "window_end": row[12],
+            "successful_login_timestamp": row[13],
         }
         for row in cursor.fetchall()
     ]

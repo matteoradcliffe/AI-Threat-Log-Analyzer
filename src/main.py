@@ -20,19 +20,22 @@ from detector import (
     detect_successful_login_after_failures,
 )
 from parser import AuthEvent, parse_auth_log_line
+from time_utils import DEFAULT_LOG_YEAR
 
 
 SAMPLE_LOG_PATH = Path(__file__).resolve().parent.parent / "data" / "sample_auth.log"
 
 
-def parse_sample_log(log_path: Path = SAMPLE_LOG_PATH) -> list[AuthEvent]:
+def parse_sample_log(
+    log_path: Path = SAMPLE_LOG_PATH, default_year: int = DEFAULT_LOG_YEAR
+) -> list[AuthEvent]:
     """Parse supported events and report the line number of rejected input."""
     events: list[AuthEvent] = []
 
     # Strict UTF-8 decoding ensures file problems are reported rather than hidden.
     with log_path.open("r", encoding="utf-8", errors="strict") as log_file:
         for line_number, line in enumerate(log_file, start=1):
-            event = parse_auth_log_line(line)
+            event = parse_auth_log_line(line, default_year=default_year)
             if event is None:
                 print(
                     f"Warning: unsupported or malformed log entry on line {line_number}.",
@@ -56,6 +59,11 @@ def print_stored_alert(alert: StoredAlert) -> None:
         print(f"Distinct users: {alert['distinct_username_count']}")
     if alert.get("username"):
         print(f"Username:       {alert['username']}")
+    if alert.get("window_start") and alert.get("window_end"):
+        print(f"Window start:   {alert['window_start']}")
+        print(f"Window end:     {alert['window_end']}")
+    if alert.get("successful_login_timestamp"):
+        print(f"Successful at:  {alert['successful_login_timestamp']}")
     print(f"Description:    {alert['description']}")
     print(f"Recommendation: {alert['recommendation']}")
     print(f"Created at:     {alert['created_at']} UTC")
